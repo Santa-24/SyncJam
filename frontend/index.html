@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SyncJam | Real-Time Synchronized Music Room</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://www.youtube.com/iframe_api"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <i class="fas fa-wave-square"></i>
+                <h1>Sync<span>Jam</span></h1>
+            </div>
+            <p class="tagline">Real-Time Synchronized Music Rooms</p>
+        </header>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Username Modal (Initially Hidden) -->
+            <div class="modal" id="username-modal">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3><i class="fas fa-user"></i> Choose Your Username</h3>
+                    </div>
+                    <div class="modal-body">
+                        <p>Enter a username to join the room:</p>
+                        <input type="text" id="username-input" placeholder="Enter username" maxlength="20">
+                        <div class="modal-actions">
+                            <button class="btn btn-primary" id="submit-username">Join Room</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Connection Section -->
+            <section class="connection-section" id="connection-section">
+                <div class="section-header">
+                    <h2><i class="fas fa-door-open"></i> Join or Create a Room</h2>
+                    <p class="section-description">Start listening to music together in perfect sync</p>
+                </div>
+                
+                <div class="connection-cards">
+                    <div class="card create-room-card">
+                        <div class="card-icon">
+                            <i class="fas fa-plus-circle"></i>
+                        </div>
+                        <h3>Create New Room</h3>
+                        <p>Create a private music room and invite friends to join</p>
+                        <div class="join-form">
+                            <input type="text" id="host-username" placeholder="Your username" maxlength="20">
+                            <button class="btn btn-primary" id="create-room-btn">
+                                <i class="fas fa-music"></i> Create Room
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="card join-room-card">
+                        <div class="card-icon">
+                            <i class="fas fa-user-friends"></i>
+                        </div>
+                        <h3>Join Existing Room</h3>
+                        <p>Join a room using a 6-digit room code</p>
+                        <div class="join-form">
+                            <input type="text" id="room-code" placeholder="Enter Room Code" maxlength="6">
+                            <button class="btn btn-secondary" id="join-room-btn">
+                                <i class="fas fa-sign-in-alt"></i> Join Room
+                            </button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="info-box">
+                    <i class="fas fa-info-circle"></i>
+                    <p>All rooms are temporary and will be automatically deleted when empty. No data is permanently stored.</p>
+                </div>
+            </section>
+
+            <!-- Room Section (Initially Hidden) -->
+            <section class="room-section" id="room-section" style="display: none;">
+                <div class="room-header">
+                    <div class="room-info">
+                        <h2><i class="fas fa-headphones"></i> Music Room</h2>
+                        <div class="room-id-display">
+                            <span class="room-id-label">Room Code:</span>
+                            <span class="room-id-value" id="current-room-code">------</span>
+                            <button class="copy-btn" id="copy-room-code" title="Copy to clipboard">
+                                <i class="far fa-copy"></i>
+                            </button>
+                            <span class="user-count">
+                                <i class="fas fa-user"></i>
+                                <span id="user-count">1</span> users
+                            </span>
+                            <button class="btn btn-secondary" id="settings-btn" title="Room Settings">
+                                <i class="fas fa-cog"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <button class="btn btn-danger" id="leave-room-btn">
+                        <i class="fas fa-sign-out-alt"></i> Leave Room
+                    </button>
+                </div>
+
+                <!-- Player Section -->
+                <div class="player-section">
+                    <div class="player-container">
+                        <!-- YouTube Player -->
+                        <div id="player"></div>
+                        
+                        <!-- Audio Only Visualizer -->
+                        <div class="audio-visualizer" id="audio-visualizer" style="display: none;">
+                            <div class="visualizer-container">
+                                <canvas id="visualizer-canvas"></canvas>
+                                <div class="song-info-audio" id="song-info-audio">
+                                    <div class="song-title">Now Playing</div>
+                                    <div class="song-details">Loading...</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Player Controls -->
+                        <div class="player-controls">
+                            <div class="song-info" id="song-info">
+                                <div class="song-title">No song loaded</div>
+                                <div class="song-details">Add a YouTube URL to start</div>
+                            </div>
+                            
+                            <div class="progress-container">
+                                <div class="progress-bar" id="progress-bar">
+                                    <div class="progress-fill" id="progress-fill"></div>
+                                </div>
+                                <div class="time-display">
+                                    <span id="current-time">0:00</span>
+                                    <span id="duration">0:00</span>
+                                </div>
+                            </div>
+                            
+                            <div class="control-buttons">
+                                <button class="control-btn" id="prev-btn" title="Previous">
+                                    <i class="fas fa-step-backward"></i>
+                                </button>
+                                <button class="control-btn play-pause-btn" id="play-pause-btn" title="Play">
+                                    <i class="fas fa-play" id="play-pause-icon"></i>
+                                </button>
+                                <button class="control-btn" id="next-btn" title="Next">
+                                    <i class="fas fa-step-forward"></i>
+                                </button>
+                                <div class="volume-control">
+                                    <i class="fas fa-volume-up"></i>
+                                    <input type="range" id="volume-slider" min="0" max="100" value="80">
+                                </div>
+                                <button class="control-btn" id="audio-only-btn" title="Audio Only Mode">
+                                    <i class="fas fa-music"></i>
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- URL Input Section -->
+                    <div class="url-input-section">
+                        <div class="input-group">
+                            <input type="text" id="youtube-url" placeholder="Paste YouTube URL or Video ID">
+                            <button class="btn btn-primary" id="load-video-btn">
+                                <i class="fas fa-play-circle"></i> Load & Sync
+                            </button>
+                            <button class="btn btn-secondary" id="add-to-playlist-btn">
+                                <i class="fas fa-plus"></i> Add to Playlist
+                            </button>
+                        </div>
+                        <div class="input-hint">
+                            <i class="fas fa-lightbulb"></i>
+                            Example: https://www.youtube.com/watch?v=dQw4w9WgXcQ or just the video ID
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Playlist Section -->
+                <div class="playlist-section" id="playlist-section">
+                    <div class="playlist-header">
+                        <h3><i class="fas fa-list"></i> Playlist</h3>
+                        <div class="playlist-controls">
+                            <button class="btn btn-secondary btn-sm" id="clear-playlist-btn">
+                                <i class="fas fa-trash"></i> Clear
+                            </button>
+                            <button class="btn btn-secondary btn-sm" id="shuffle-playlist-btn">
+                                <i class="fas fa-random"></i> Shuffle
+                            </button>
+                        </div>
+                    </div>
+                    <div class="playlist-container">
+                        <div class="playlist-list" id="playlist-list">
+                            <div class="empty-playlist">
+                                <i class="fas fa-music"></i>
+                                <p>No songs in playlist. Add some to get started!</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Users & Chat Section -->
+                <div class="bottom-panel">
+                    <div class="users-panel">
+                        <div class="users-header">
+                            <h3><i class="fas fa-users"></i> Connected Users</h3>
+                            <button class="btn btn-secondary btn-sm" id="change-username-btn">
+                                <i class="fas fa-edit"></i> Edit
+                            </button>
+                        </div>
+                        <div class="users-list" id="users-list">
+                            <!-- Users will be added here dynamically -->
+                        </div>
+                    </div>
+                    
+                    <div class="chat-panel">
+                        <h3><i class="fas fa-comments"></i> Chat</h3>
+                        <div class="chat-messages" id="chat-messages">
+                            <div class="system-message">
+                                Welcome to the music room! Messages are temporary and will disappear when you leave.
+                            </div>
+                        </div>
+                        <div class="chat-input">
+                            <input type="text" id="chat-input" placeholder="Type a message...">
+                            <button class="btn btn-secondary" id="send-chat-btn">
+                                <i class="fas fa-paper-plane"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Settings Modal -->
+        <div class="modal" id="settings-modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3><i class="fas fa-cog"></i> Room Settings</h3>
+                    <button class="close-modal">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="settings-group">
+                        <h4><i class="fas fa-users"></i> Playlist Settings</h4>
+                        <div class="setting-item">
+                            <label class="switch">
+                                <input type="checkbox" id="collaborative-playlist">
+                                <span class="slider"></span>
+                            </label>
+                            <div class="setting-info">
+                                <div class="setting-title">Collaborative Playlist</div>
+                                <div class="setting-description">Allow all users to add songs to playlist</div>
+                            </div>
+                        </div>
+                        <div class="setting-item">
+                            <label class="switch">
+                                <input type="checkbox" id="auto-play-next" checked>
+                                <span class="slider"></span>
+                            </label>
+                            <div class="setting-info">
+                                <div class="setting-title">Auto-play Next</div>
+                                <div class="setting-description">Automatically play next song when current ends</div>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="settings-group">
+                        <h4><i class="fas fa-vote-yea"></i> Voting System</h4>
+                        <div class="setting-item">
+                            <div class="radio-group">
+                                <label>
+                                    <input type="radio" name="vote-mode" value="sequential" checked>
+                                    Sequential Play
+                                </label>
+                                <label>
+                                    <input type="radio" name="vote-mode" value="popularity">
+                                    Vote-based Play
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="modal-actions">
+                        <button class="btn btn-primary" id="save-settings">Save Settings</button>
+                        <button class="btn btn-secondary close-modal">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Username Change Modal -->
+        <div class="modal" id="change-username-modal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3><i class="fas fa-user-edit"></i> Change Username</h3>
+                    <button class="close-modal">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p>Enter your new username:</p>
+                    <input type="text" id="new-username-input" placeholder="New username" maxlength="20">
+                    <div class="modal-actions">
+                        <button class="btn btn-primary" id="save-username">Save</button>
+                        <button class="btn btn-secondary close-modal">Cancel</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Bar -->
+        <footer class="status-bar">
+            <div class="status-left">
+                <div class="connection-status" id="connection-status">
+                    <i class="fas fa-circle connected"></i>
+                    <span>Connected</span>
+                </div>
+                <div class="latency-info" id="latency-info">
+                    <i class="fas fa-bolt"></i>
+                    <span>Latency: <span id="latency-value">--</span>ms</span>
+                </div>
+            </div>
+            <div class="status-right">
+                <div class="sync-status" id="sync-status">
+                    <i class="fas fa-sync-alt"></i>
+                    <span>Sync: <span id="sync-status-text">Active</span></span>
+                </div>
+                <div class="audio-mode" id="audio-mode" style="display: none;">
+                    <i class="fas fa-music"></i>
+                    <span>Audio Only</span>
+                </div>
+            </div>
+        </footer>
+    </div>
+
+    <!-- Room Creation Modal -->
+    <div class="modal" id="room-created-modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-check-circle"></i> Room Created Successfully!</h3>
+                <button class="close-modal">&times;</button>
+            </div>
+            <div class="modal-body">
+                <p>Your music room has been created. Share the code below with friends to invite them:</p>
+                <div class="room-code-display">
+                    <span id="new-room-code">------</span>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-primary" id="copy-modal-code">
+                        <i class="far fa-copy"></i> Copy Code
+                    </button>
+                    <button class="btn btn-secondary close-modal">Close</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toast-container"></div>
+
+    <!-- Scripts -->
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

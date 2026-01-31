@@ -1,0 +1,32 @@
+{
+  "name": "syncjam",
+  "version": "1.0.0",
+  "description": "Real-Time Synchronized YouTube Music Room",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.22.1",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "music",
+    "sync",
+    "real-time",
+    "youtube",
+    "socket.io",
+    "websockets",
+    "render"
+  ],
+  "author": "SyncJam Team",
+  "license": "MIT"
+}

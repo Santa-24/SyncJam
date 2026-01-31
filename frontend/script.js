@@ -5,18 +5,15 @@ let currentRoom = null;
 let isHost = false;
 let users = [];
 let currentVideoId = null;
-let syncInterval;
-let lastSyncTime = Date.now();
 let playlist = [];
 let audioOnly = false;
-let visualizerContext;
 let username = null;
 let latency = 0;
-let roomSettings = {
-    collaborativePlaylist: false,
-    autoPlayNext: true,
-    voteMode: 'sequential'
-};
+let serverTimeOffset = 0; // Offset between server and client time
+let syncInterval;
+let lastSyncedTime = 0;
+let lastSyncedState = 'paused';
+let lastSyncTimestamp = 0;
 
 // DOM Elements
 const connectionSection = document.getElementById('connection-section');
@@ -44,52 +41,198 @@ const progressBar = document.getElementById('progress-bar');
 const progressFill = document.getElementById('progress-fill');
 const currentTimeDisplay = document.getElementById('current-time');
 const durationDisplay = document.getElementById('duration');
-const songInfo = document.getElementById('song-info');
 const audioOnlyBtn = document.getElementById('audio-only-btn');
-const audioModeIndicator = document.getElementById('audio-mode');
 const audioVisualizer = document.getElementById('audio-visualizer');
 const visualizerCanvas = document.getElementById('visualizer-canvas');
 const songInfoAudio = document.getElementById('song-info-audio');
-const playlistSection = document.getElementById('playlist-section');
 const playlistList = document.getElementById('playlist-list');
 const clearPlaylistBtn = document.getElementById('clear-playlist-btn');
 const shufflePlaylistBtn = document.getElementById('shuffle-playlist-btn');
 const usersList = document.getElementById('users-list');
-const changeUsernameBtn = document.getElementById('change-username-btn');
 const chatMessages = document.getElementById('chat-messages');
 const chatInput = document.getElementById('chat-input');
 const sendChatBtn = document.getElementById('send-chat-btn');
 const connectionStatus = document.getElementById('connection-status');
-const syncStatus = document.getElementById('sync-status');
-const syncStatusText = document.getElementById('sync-status-text');
 const latencyInfo = document.getElementById('latency-info');
 const latencyValue = document.getElementById('latency-value');
-const settingsBtn = document.getElementById('settings-btn');
-const settingsModal = document.getElementById('settings-modal');
-const collaborativePlaylistToggle = document.getElementById('collaborative-playlist');
-const autoPlayNextToggle = document.getElementById('auto-play-next');
-const voteModeRadios = document.querySelectorAll('input[name="vote-mode"]');
-const saveSettingsBtn = document.getElementById('save-settings');
-const changeUsernameModal = document.getElementById('change-username-modal');
-const newUsernameInput = document.getElementById('new-username-input');
-const saveUsernameBtn = document.getElementById('save-username');
 const roomCreatedModal = document.getElementById('room-created-modal');
 const newRoomCode = document.getElementById('new-room-code');
 const copyModalCodeBtn = document.getElementById('copy-modal-code');
 
-// State variables for voting
-const userVotes = new Map(); // videoId -> 'like' | 'dislike'
-let currentPlaylistItemId = null;
 let pendingJoinData = null;
+let visualizerAnimationId = null;
 
-// Initialize YouTube Player
+// Initialize Socket.IO
+function initSocket() {
+    socket = io({
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 5
+    });
+
+    socket.on('connect', () => {
+        updateConnectionStatus(true);
+        showToast('Connected', 'Connected to server', 'success');
+    });
+
+    socket.on('disconnect', () => {
+        updateConnectionStatus(false);
+        showToast('Disconnected', 'Lost connection to server', 'error');
+    });
+
+    socket.on('server-time', (data) => {
+        const clientTime = Date.now();
+        serverTimeOffset = data.serverTime - clientTime;
+    });
+
+    socket.on('room-created', (data) => {
+        currentRoom = data.room;
+        username = data.username;
+        isHost = true;
+        
+        newRoomCode.textContent = data.room;
+        roomCreatedModal.classList.add('active');
+        
+        switchToRoomView();
+    });
+
+    socket.on('room-joined', (data) => {
+        currentRoom = data.room;
+        username = data.username;
+        isHost = data.isHost;
+        users = data.users;
+        playlist = data.playlist;
+        
+        // Calculate server time offset
+        if (data.serverTime) {
+            const clientTime = Date.now();
+            serverTimeOffset = data.serverTime - clientTime;
+        }
+        
+        switchToRoomView();
+        updateUsersList(users);
+        updatePlaylist(playlist);
+        
+        if (data.currentVideo) {
+            loadVideoForClient(data.currentVideo.videoId, data.currentVideo.title, data.currentVideo.duration);
+            
+            // Sync to current playback position
+            setTimeout(() => {
+                if (data.playbackState === 'playing') {
+                    player.seekTo(data.playbackTime, true);
+                    player.playVideo();
+                } else {
+                    player.seekTo(data.playbackTime, true);
+                    player.pauseVideo();
+                }
+            }, 500);
+        }
+        
+        showToast('Joined', `Joined room ${data.room}`, 'success');
+    });
+
+    socket.on('room-join-error', (data) => {
+        showToast('Error', data.message, 'error');
+    });
+
+    socket.on('user-joined', (data) => {
+        users = data.users;
+        updateUsersList(users);
+        showToast('User Joined', `${data.user.name} joined the room`, 'info');
+    });
+
+    socket.on('user-left', (data) => {
+        users = data.users;
+        updateUsersList(users);
+        showToast('User Left', `${data.user.name} left the room`, 'info');
+    });
+
+    socket.on('host-changed', (data) => {
+        users = data.users;
+        updateUsersList(users);
+        
+        if (socket.id === data.newHost) {
+            isHost = true;
+            showToast('You are now the host', 'You can now control playback', 'info');
+        }
+    });
+
+    socket.on('video-change', (data) => {
+        loadVideoForClient(data.videoId, data.title, data.duration);
+    });
+
+    socket.on('playlist-updated', (data) => {
+        playlist = data.playlist;
+        updatePlaylist(playlist);
+    });
+
+    socket.on('player-state-change', (data) => {
+        if (isHost) return; // Host controls their own playback
+        
+        const serverTime = data.serverTime || Date.now() + serverTimeOffset;
+        const networkDelay = (Date.now() + serverTimeOffset) - serverTime;
+        
+        if (data.state === 'playing') {
+            // Compensate for network delay
+            const adjustedTime = data.timestamp + (networkDelay / 1000);
+            player.seekTo(adjustedTime, true);
+            player.playVideo();
+        } else if (data.state === 'paused') {
+            player.seekTo(data.timestamp, true);
+            player.pauseVideo();
+        }
+        
+        updatePlayPauseButton(data.state);
+    });
+
+    socket.on('sync-time', (data) => {
+        if (isHost) return;
+        
+        const serverTime = data.serverTime || Date.now() + serverTimeOffset;
+        const networkDelay = (Date.now() + serverTimeOffset) - serverTime;
+        
+        // Compensate for network latency
+        const adjustedTime = data.timestamp + (networkDelay / 1000);
+        
+        const currentTime = player.getCurrentTime();
+        const timeDiff = Math.abs(currentTime - adjustedTime);
+        
+        // Only sync if difference is significant (> 0.5 seconds)
+        if (timeDiff > 0.5) {
+            player.seekTo(adjustedTime, true);
+        }
+        
+        if (data.state === 'playing' && player.getPlayerState() !== YT.PlayerState.PLAYING) {
+            player.playVideo();
+        } else if (data.state === 'paused' && player.getPlayerState() === YT.PlayerState.PLAYING) {
+            player.pauseVideo();
+        }
+    });
+
+    socket.on('audio-only-changed', (data) => {
+        audioOnly = data.audioOnly;
+        toggleAudioOnlyDisplay(audioOnly);
+    });
+
+    socket.on('chat-message', (data) => {
+        addChatMessage(data.user, data.message, data.timestamp);
+    });
+
+    socket.on('pong', (timestamp) => {
+        latency = Date.now() - timestamp;
+        updateLatencyDisplay(latency);
+    });
+}
+
+// YouTube Player
 function initYouTubePlayer() {
     player = new YT.Player('player', {
-        height: '400',
+        height: '100%',
         width: '100%',
         playerVars: {
             'autoplay': 0,
-            'controls': 0, // Hide YouTube controls for custom ones
+            'controls': 0,
             'rel': 0,
             'showinfo': 0,
             'modestbranding': 1,
@@ -98,597 +241,82 @@ function initYouTubePlayer() {
         },
         events: {
             'onReady': onPlayerReady,
-            'onStateChange': onPlayerStateChange,
-            'onError': onPlayerError
+            'onStateChange': onPlayerStateChange
         }
     });
 }
 
-// YouTube API Callback
 function onYouTubeIframeAPIReady() {
     initYouTubePlayer();
     initVisualizer();
 }
 
 function onPlayerReady(event) {
-    console.log('YouTube player ready');
-    event.target.setVolume(80);
+    event.target.setVolume(volumeSlider.value);
     
-    // Update volume slider to match player
-    volumeSlider.value = player.getVolume();
-    
-    // Start sync interval if in a room
-    if (currentRoom) {
+    if (currentRoom && isHost) {
         startSyncInterval();
     }
 }
 
 function onPlayerStateChange(event) {
-    if (!currentRoom) return;
+    if (!currentRoom || !isHost) return;
     
     const state = event.data;
     const currentTime = player.getCurrentTime();
-    const videoId = player.getVideoData()?.video_id;
     
-    // Update visualizer for audio-only mode
-    if (audioOnly && state === YT.PlayerState.PLAYING) {
-        startVisualizer();
-    } else if (audioOnly && (state === YT.PlayerState.PAUSED || state === YT.PlayerState.ENDED)) {
-        stopVisualizer();
+    if (audioOnly) {
+        if (state === YT.PlayerState.PLAYING) {
+            startVisualizer();
+        } else {
+            stopVisualizer();
+        }
     }
     
-    // If video ended and auto-play next is enabled
-    if (state === YT.PlayerState.ENDED && roomSettings.autoPlayNext && isHost && playlist.length > 0) {
+    // Auto-play next video
+    if (state === YT.PlayerState.ENDED && playlist.length > 0) {
         setTimeout(() => {
-            socket.emit('next-video', { room: currentRoom });
+            playNextVideo();
         }, 1000);
     }
     
-    // Broadcast state changes to room (only if host)
-    if (isHost && videoId) {
-        if (state === YT.PlayerState.PLAYING) {
-            socket.emit('player-state-change', {
-                room: currentRoom,
-                state: 'playing',
-                timestamp: currentTime
-            });
-        } else if (state === YT.PlayerState.PAUSED) {
-            socket.emit('player-state-change', {
-                room: currentRoom,
-                state: 'paused',
-                timestamp: currentTime
-            });
-        }
-    }
-}
-
-function onPlayerError(event) {
-    showToast('Error', 'Failed to load video. Please check the URL.', 'error');
-    console.error('YouTube player error:', event);
-}
-
-// Audio Visualizer
-function initVisualizer() {
-    visualizerCanvas.width = visualizerCanvas.offsetWidth;
-    visualizerCanvas.height = visualizerCanvas.offsetHeight;
-    visualizerContext = visualizerCanvas.getContext('2d');
-    
-    // Handle window resize
-    window.addEventListener('resize', () => {
-        visualizerCanvas.width = visualizerCanvas.offsetWidth;
-        visualizerCanvas.height = visualizerCanvas.offsetHeight;
-    });
-}
-
-function startVisualizer() {
-    if (!visualizerContext) return;
-    
-    const draw = () => {
-        if (!player || player.getPlayerState() !== YT.PlayerState.PLAYING) {
-            stopVisualizer();
-            return;
-        }
-        
-        // Clear canvas
-        visualizerContext.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
-        
-        // Create gradient
-        const gradient = visualizerContext.createLinearGradient(0, 0, visualizerCanvas.width, 0);
-        gradient.addColorStop(0, 'rgba(0, 212, 255, 0.1)');
-        gradient.addColorStop(0.5, 'rgba(131, 56, 236, 0.3)');
-        gradient.addColorStop(1, 'rgba(0, 212, 255, 0.1)');
-        
-        // Draw waveform effect
-        const time = Date.now() / 1000;
-        const amplitude = 50;
-        const frequency = 0.02;
-        const segments = 100;
-        
-        visualizerContext.beginPath();
-        visualizerContext.moveTo(0, visualizerCanvas.height / 2);
-        
-        for (let i = 0; i <= segments; i++) {
-            const x = (i / segments) * visualizerCanvas.width;
-            const y = visualizerCanvas.height / 2 + 
-                Math.sin(time * 2 + i * frequency) * amplitude * 
-                Math.sin(i * Math.PI / segments) * 
-                (0.5 + 0.5 * Math.sin(time));
-            
-            visualizerContext.lineTo(x, y);
-        }
-        
-        visualizerContext.lineTo(visualizerCanvas.width, visualizerCanvas.height);
-        visualizerContext.lineTo(0, visualizerCanvas.height);
-        visualizerContext.closePath();
-        
-        visualizerContext.fillStyle = gradient;
-        visualizerContext.fill();
-        
-        // Draw audio bars
-        const barCount = 60;
-        const barWidth = visualizerCanvas.width / barCount;
-        const barSpacing = 2;
-        
-        for (let i = 0; i < barCount; i++) {
-            const barHeight = 20 + Math.sin(time * 3 + i * 0.3) * 30 + 
-                Math.cos(time * 2 + i * 0.2) * 20;
-            const x = i * barWidth;
-            const y = visualizerCanvas.height - barHeight;
-            
-            visualizerContext.fillStyle = `rgba(${100 + i * 2}, ${150 + i}, ${255}, ${0.5 + 0.3 * Math.sin(time + i * 0.1)})`;
-            visualizerContext.fillRect(x + barSpacing, y, barWidth - barSpacing * 2, barHeight);
-        }
-        
-        requestAnimationFrame(draw);
-    };
-    
-    draw();
-}
-
-function stopVisualizer() {
-    if (visualizerContext) {
-        visualizerContext.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
-    }
-}
-
-function toggleAudioOnly() {
-    audioOnly = !audioOnly;
-    
-    if (audioOnly) {
-        // Hide video player, show visualizer
-        document.getElementById('player').style.display = 'none';
-        audioVisualizer.style.display = 'block';
-        audioModeIndicator.style.display = 'flex';
-        audioOnlyBtn.innerHTML = '<i class="fas fa-video"></i>';
-        audioOnlyBtn.title = 'Show Video';
-        
-        // Update song info in visualizer
-        const videoData = player.getVideoData();
-        if (videoData && videoData.title) {
-            songInfoAudio.querySelector('.song-title').textContent = videoData.title;
-            songInfoAudio.querySelector('.song-details').textContent = videoData.author || 'YouTube';
-        }
-        
-        // Start visualizer if playing
-        if (player.getPlayerState() === YT.PlayerState.PLAYING) {
-            startVisualizer();
-        }
-    } else {
-        // Show video player, hide visualizer
-        document.getElementById('player').style.display = 'block';
-        audioVisualizer.style.display = 'none';
-        audioModeIndicator.style.display = 'none';
-        audioOnlyBtn.innerHTML = '<i class="fas fa-music"></i>';
-        audioOnlyBtn.title = 'Audio Only Mode';
-        stopVisualizer();
-    }
-    
-    // Notify server if host
-    if (isHost && currentRoom) {
-        socket.emit('toggle-audio-only', {
+    // Broadcast state changes
+    if (state === YT.PlayerState.PLAYING) {
+        socket.emit('player-state-change', {
             room: currentRoom,
-            audioOnly: audioOnly
+            state: 'playing',
+            timestamp: currentTime
         });
+        updatePlayPauseButton('playing');
+    } else if (state === YT.PlayerState.PAUSED) {
+        socket.emit('player-state-change', {
+            room: currentRoom,
+            state: 'paused',
+            timestamp: currentTime
+        });
+        updatePlayPauseButton('paused');
     }
-}
-
-// Initialize Socket.io connection
-function initSocket() {
-    socket = io({
-        reconnection: true,
-        reconnectionAttempts: 5,
-        reconnectionDelay: 1000
-    });
-    
-    // Connection status
-    socket.on('connect', () => {
-        updateConnectionStatus(true);
-        console.log('Connected to server');
-        
-        // If we have pending join data, try to join
-        if (pendingJoinData) {
-            const { room, username, isCreate } = pendingJoinData;
-            if (isCreate) {
-                socket.emit('create-room', { username });
-            } else {
-                socket.emit('join-room', { room, username });
-            }
-            pendingJoinData = null;
-        }
-    });
-    
-    socket.on('disconnect', () => {
-        updateConnectionStatus(false);
-        console.log('Disconnected from server');
-    });
-    
-    socket.on('connect_error', (error) => {
-        showToast('Connection Error', 'Unable to connect to server', 'error');
-        console.error('Connection error:', error);
-        pendingJoinData = null;
-    });
-    
-    // Room events
-    socket.on('room-created', (data) => {
-        currentRoom = data.room;
-        username = data.username;
-        isHost = true;
-        newRoomCode.textContent = currentRoom;
-        showRoomCreatedModal();
-        switchToRoomView();
-        updateRoomCode(currentRoom);
-        updateUserList([{ id: socket.id, name: username, isHost: true, volume: 100 }]);
-        showToast('Success', `Room ${currentRoom} created!`, 'success');
-    });
-    
-    socket.on('room-joined', (data) => {
-        currentRoom = data.room;
-        username = data.username;
-        isHost = data.isHost;
-        switchToRoomView();
-        updateRoomCode(currentRoom);
-        updateUserList(data.users);
-        playlist = data.playlist || [];
-        audioOnly = data.audioOnly || false;
-        roomSettings.collaborativePlaylist = data.collaborativePlaylist || false;
-        roomSettings.autoPlayNext = data.autoPlayNext !== false;
-        roomSettings.voteMode = data.voteMode || 'sequential';
-        
-        // Update UI based on settings
-        updateSettingsUI();
-        
-        // Update audio mode
-        if (audioOnly) {
-            toggleAudioOnly();
-        }
-        
-        // Update playlist
-        updatePlaylistUI();
-        
-        // If there's a video playing, sync with it
-        if (data.currentVideo) {
-            loadVideo(data.currentVideo.videoId, data.currentVideo.title, data.currentVideo.duration);
-        }
-        
-        // If playback state is available, sync with it
-        if (data.playbackState && data.playbackTime !== undefined) {
-            setTimeout(() => {
-                if (player && player.getPlayerState) {
-                    if (data.playbackState === 'playing') {
-                        player.playVideo();
-                        syncVideoTime(data.playbackTime);
-                    } else {
-                        player.pauseVideo();
-                        syncVideoTime(data.playbackTime);
-                    }
-                }
-            }, 1000);
-        }
-        
-        showToast('Success', `Joined room ${currentRoom} as ${username}`, 'success');
-    });
-    
-    socket.on('room-join-error', (data) => {
-        showToast('Error', data.message, 'error');
-        pendingJoinData = null;
-    });
-    
-    socket.on('username-error', (data) => {
-        showToast('Error', data.message, 'error');
-    });
-    
-    socket.on('user-joined', (data) => {
-        updateUserList(data.users);
-        showToast('Info', `${data.user.name} joined the room`, 'success');
-        addSystemMessage(`${data.user.name} joined the room`);
-    });
-    
-    socket.on('user-left', (data) => {
-        updateUserList(data.users);
-        showToast('Info', `${data.user.name} left the room`, 'warning');
-        addSystemMessage(`${data.user.name} left the room`);
-    });
-    
-    socket.on('username-updated', (data) => {
-        if (data.userId === socket.id) {
-            username = data.newName;
-            showToast('Success', `Username changed to ${username}`, 'success');
-        }
-        updateUserList(data.users);
-        addSystemMessage(`${data.oldName} changed username to ${data.newName}`);
-    });
-    
-    // Video synchronization events
-    socket.on('video-changed', (data) => {
-        if (!isHost && data.videoId) {
-            loadVideo(data.videoId, data.title, data.duration);
-        }
-    });
-    
-    socket.on('player-state-change', (data) => {
-        if (!isHost && player && player.getPlayerState) {
-            if (data.state === 'playing') {
-                player.playVideo();
-                syncVideoTime(data.timestamp);
-            } else if (data.state === 'paused') {
-                player.pauseVideo();
-                syncVideoTime(data.timestamp);
-            }
-        }
-    });
-    
-    socket.on('sync-time', (data) => {
-        if (!isHost && player) {
-            // Calculate compensated time based on latency
-            const now = Date.now();
-            const timeSinceSync = now - data.serverTime;
-            const compensatedTime = data.timestamp + (timeSinceSync / 1000);
-            
-            syncVideoTime(compensatedTime);
-            
-            // Update latency display
-            latency = data.latency || 0;
-            updateLatency(latency);
-        }
-    });
-    
-    // Playlist events
-    socket.on('playlist-updated', (data) => {
-        playlist = data.playlist || [];
-        updatePlaylistUI();
-        
-        if (data.addedVideo) {
-            addSystemMessage(`${data.addedVideo.addedBy} added "${data.addedVideo.title}" to playlist`);
-        } else if (data.removedVideo) {
-            addSystemMessage(`Song removed from playlist`);
-        }
-    });
-    
-    socket.on('votes-updated', (data) => {
-        updateVotesUI(data.videoId, data.votes);
-    });
-    
-    // Volume events
-    socket.on('volume-updated', (data) => {
-        // Individual volume control for this user
-        if (player) {
-            player.setVolume(data.volume);
-            volumeSlider.value = data.volume;
-        }
-    });
-    
-    // Audio-only mode
-    socket.on('audio-only-changed', (data) => {
-        if (audioOnly !== data.audioOnly) {
-            audioOnly = data.audioOnly;
-            if (audioOnly) {
-                document.getElementById('player').style.display = 'none';
-                audioVisualizer.style.display = 'block';
-                audioModeIndicator.style.display = 'flex';
-                if (player.getPlayerState() === YT.PlayerState.PLAYING) {
-                    startVisualizer();
-                }
-            } else {
-                document.getElementById('player').style.display = 'block';
-                audioVisualizer.style.display = 'none';
-                audioModeIndicator.style.display = 'none';
-                stopVisualizer();
-            }
-        }
-    });
-    
-    // Room settings
-    socket.on('room-settings-updated', (data) => {
-        roomSettings = { ...roomSettings, ...data.settings };
-        updateSettingsUI();
-        showToast('Settings Updated', 'Room settings have been updated', 'info');
-    });
-    
-    // Chat events
-    socket.on('chat-message', (data) => {
-        addChatMessage(data.user, data.message, data.timestamp);
-    });
-    
-    // Latency test
-    socket.on('pong', (timestamp) => {
-        const newLatency = Date.now() - timestamp;
-        latency = newLatency;
-        updateLatency(latency);
-        
-        // Adjust sync based on latency
-        if (latency > 100) {
-            syncStatusText.textContent = 'Lagging';
-            syncStatus.style.color = 'var(--warning)';
-        } else if (latency > 50) {
-            syncStatusText.textContent = 'Good';
-            syncStatus.style.color = 'var(--success)';
-        } else {
-            syncStatusText.textContent = 'Excellent';
-            syncStatus.style.color = 'var(--primary)';
-        }
-    });
-}
-
-// Room Management
-function createRoom() {
-    const username = hostUsernameInput.value.trim() || getRandomUserName();
-    if (!username) {
-        showToast('Error', 'Please enter a username', 'error');
-        return;
-    }
-    
-    if (socket.connected) {
-        socket.emit('create-room', { username });
-    } else {
-        pendingJoinData = { username, isCreate: true };
-        showToast('Connecting', 'Connecting to server...', 'info');
-    }
-}
-
-function joinRoom() {
-    const code = roomCodeInput.value.trim().toUpperCase();
-    const username = getRandomUserName();
-    
-    if (!code || code.length !== 6) {
-        showToast('Error', 'Please enter a valid 6-character room code', 'error');
-        return;
-    }
-    
-    // Show username modal for joining users
-    showUsernameModal(code, username, false);
-}
-
-function showUsernameModal(roomCode, defaultUsername, isCreate) {
-    usernameModal.classList.add('active');
-    usernameInput.value = defaultUsername;
-    usernameInput.focus();
-    
-    const joinHandler = () => {
-        const username = usernameInput.value.trim() || defaultUsername;
-        if (!username) {
-            showToast('Error', 'Please enter a username', 'error');
-            return;
-        }
-        
-        usernameModal.classList.remove('active');
-        
-        if (socket.connected) {
-            if (isCreate) {
-                socket.emit('create-room', { username });
-            } else {
-                socket.emit('join-room', { room: roomCode, username });
-            }
-        } else {
-            pendingJoinData = { room: roomCode, username, isCreate };
-            showToast('Connecting', 'Connecting to server...', 'info');
-        }
-    };
-    
-    submitUsernameBtn.onclick = joinHandler;
-    usernameInput.onkeypress = (e) => {
-        if (e.key === 'Enter') joinHandler();
-    };
-}
-
-function leaveRoom() {
-    if (currentRoom) {
-        socket.emit('leave-room', { room: currentRoom });
-        currentRoom = null;
-        isHost = false;
-        username = null;
-        switchToConnectionView();
-        stopSyncInterval();
-        stopVisualizer();
-        
-        // Reset player
-        if (player) {
-            player.stopVideo();
-        }
-        
-        showToast('Info', 'Left the room', 'warning');
-    }
-}
-
-// Video Management
-function loadVideo(videoId, title, duration) {
-    if (!videoId) return;
-    
-    const videoData = {
-        videoId,
-        title: title || `Video ${videoId}`,
-        duration: duration || 0
-    };
-    
-    currentVideoId = videoId;
-    
-    if (player) {
-        player.loadVideoById(videoId);
-        
-        // Update song info
-        updateSongInfo(videoData);
-        
-        // If host, broadcast to room
-        if (isHost && currentRoom) {
-            socket.emit('video-change', {
-                room: currentRoom,
-                ...videoData
-            });
-        }
-        
-        // Highlight current song in playlist
-        updateCurrentPlaylistItem(videoId);
-    }
-}
-
-function addToPlaylist(videoId, title, duration) {
-    if (!videoId || !currentRoom) return;
-    
-    const videoData = {
-        videoId,
-        title: title || `Video ${videoId}`,
-        duration: duration || 0,
-        addedBy: username
-    };
-    
-    socket.emit('add-to-playlist', {
-        room: currentRoom,
-        ...videoData
-    });
-}
-
-function extractVideoId(url) {
-    // If it's already a video ID (11 characters)
-    if (url.length === 11 && !url.includes('/') && !url.includes('?')) {
-        return { id: url, title: null, duration: 0 };
-    }
-    
-    // Try to extract from various YouTube URL formats
-    const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-    const match = url.match(regex);
-    return match ? { id: match[1], title: null, duration: 0 } : null;
 }
 
 // Synchronization
 function startSyncInterval() {
     if (syncInterval) clearInterval(syncInterval);
     
+    // Sync every 2 seconds for smooth playback
     syncInterval = setInterval(() => {
-        if (isHost && player && currentRoom && currentVideoId) {
+        if (!isHost || !currentRoom || !player) return;
+        
+        const playerState = player.getPlayerState();
+        if (playerState === YT.PlayerState.PLAYING) {
             const currentTime = player.getCurrentTime();
-            const playerState = player.getPlayerState();
             
-            // Broadcast sync time every 2 seconds with latency compensation
-            if (Date.now() - lastSyncTime > 2000) {
-                socket.emit('sync-time', {
-                    room: currentRoom,
-                    timestamp: currentTime,
-                    state: playerState === 1 ? 'playing' : 'paused',
-                    clientTime: Date.now()
-                });
-                lastSyncTime = Date.now();
-            }
+            socket.emit('sync-time', {
+                room: currentRoom,
+                timestamp: currentTime,
+                state: 'playing'
+            });
         }
-    }, 100);
+    }, 2000);
 }
 
 function stopSyncInterval() {
@@ -698,112 +326,131 @@ function stopSyncInterval() {
     }
 }
 
-function syncVideoTime(timestamp) {
-    if (player && typeof timestamp === 'number') {
-        const currentTime = player.getCurrentTime();
-        const diff = Math.abs(currentTime - timestamp);
-        
-        // Only sync if difference is significant (more than 0.5 second)
-        if (diff > 0.5) {
-            player.seekTo(timestamp, true);
+// Visualizer
+function initVisualizer() {
+    visualizerCanvas.width = visualizerCanvas.offsetWidth;
+    visualizerCanvas.height = visualizerCanvas.offsetHeight;
+    
+    window.addEventListener('resize', () => {
+        visualizerCanvas.width = visualizerCanvas.offsetWidth;
+        visualizerCanvas.height = visualizerCanvas.offsetHeight;
+    });
+}
+
+function startVisualizer() {
+    const ctx = visualizerCanvas.getContext('2d');
+    const bars = 64;
+    
+    function draw() {
+        if (!player || player.getPlayerState() !== YT.PlayerState.PLAYING) {
+            stopVisualizer();
+            return;
         }
+        
+        ctx.clearRect(0, 0, visualizerCanvas.width, visualizerCanvas.height);
+        
+        const barWidth = visualizerCanvas.width / bars;
+        const time = Date.now() / 1000;
+        
+        for (let i = 0; i < bars; i++) {
+            const height = Math.abs(Math.sin(time + i * 0.2)) * visualizerCanvas.height * 0.5;
+            const x = i * barWidth;
+            const y = (visualizerCanvas.height - height) / 2;
+            
+            const gradient = ctx.createLinearGradient(0, y, 0, y + height);
+            gradient.addColorStop(0, '#6366f1');
+            gradient.addColorStop(1, '#ec4899');
+            
+            ctx.fillStyle = gradient;
+            ctx.fillRect(x, y, barWidth - 2, height);
+        }
+        
+        visualizerAnimationId = requestAnimationFrame(draw);
+    }
+    
+    draw();
+}
+
+function stopVisualizer() {
+    if (visualizerAnimationId) {
+        cancelAnimationFrame(visualizerAnimationId);
+        visualizerAnimationId = null;
     }
 }
 
-// Playlist Management
-function updatePlaylistUI() {
-    if (!playlist || playlist.length === 0) {
-        playlistList.innerHTML = `
-            <div class="empty-playlist">
-                <i class="fas fa-music"></i>
-                <p>No songs in playlist. Add some to get started!</p>
-            </div>
-        `;
+// Video Loading
+function extractVideoId(url) {
+    // Handle direct video ID
+    if (url.length === 11 && !url.includes('/') && !url.includes('.')) {
+        return { id: url, title: 'YouTube Video', duration: 0 };
+    }
+    
+    // Handle YouTube URLs
+    const patterns = [
+        /(?:youtube\.com\/watch\?v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/,
+        /youtube\.com\/embed\/([a-zA-Z0-9_-]{11})/,
+        /youtube\.com\/v\/([a-zA-Z0-9_-]{11})/
+    ];
+    
+    for (const pattern of patterns) {
+        const match = url.match(pattern);
+        if (match) {
+            return { id: match[1], title: 'YouTube Video', duration: 0 };
+        }
+    }
+    
+    return null;
+}
+
+function loadVideo(videoId, title, duration) {
+    if (!isHost) {
+        showToast('Permission Denied', 'Only the host can change videos', 'error');
         return;
     }
     
-    playlistList.innerHTML = '';
+    currentVideoId = videoId;
     
-    playlist.forEach((video, index) => {
-        const playlistItem = document.createElement('div');
-        playlistItem.className = `playlist-item ${video.id === currentVideoId ? 'playing' : ''}`;
-        playlistItem.dataset.videoId = video.id;
-        playlistItem.draggable = isHost;
-        
-        // Get vote counts
-        const votes = userVotes.get(video.id) || [];
-        const likeCount = votes.filter(v => v.vote === 'like').length;
-        const dislikeCount = votes.filter(v => v.vote === 'dislike').length;
-        const userVote = votes.find(v => v.userId === socket.id)?.vote;
-        
-        // Format duration
-        const duration = video.duration > 0 ? formatTime(video.duration) : '--:--';
-        
-        playlistItem.innerHTML = `
-            <div class="drag-handle" style="${isHost ? '' : 'display: none;'}">
-                <i class="fas fa-grip-vertical"></i>
-            </div>
-            <div class="song-number">${index + 1}</div>
-            <div class="song-info">
-                <div class="song-title" title="${video.title}">${video.title}</div>
-                <div class="song-details">Added by ${video.addedBy}</div>
-            </div>
-            <div class="song-duration">${duration}</div>
-            <div class="song-actions">
-                <button class="vote-btn ${userVote === 'like' ? 'active' : ''}" 
-                        onclick="voteSong('${video.id}', 'like')"
-                        title="Like">
-                    <i class="fas fa-thumbs-up"></i>
-                </button>
-                <span class="vote-count">${likeCount}</span>
-                <button class="vote-btn dislike ${userVote === 'dislike' ? 'active' : ''}" 
-                        onclick="voteSong('${video.id}', 'dislike')"
-                        title="Dislike">
-                    <i class="fas fa-thumbs-down"></i>
-                </button>
-                <span class="vote-count">${dislikeCount}</span>
-                ${isHost ? `
-                <button class="remove-btn" onclick="removeFromPlaylist('${video.id}')" title="Remove">
-                    <i class="fas fa-times"></i>
-                </button>
-                ` : ''}
-            </div>
-        `;
-        
-        // Add drag events for host
-        if (isHost) {
-            playlistItem.addEventListener('dragstart', handleDragStart);
-            playlistItem.addEventListener('dragover', handleDragOver);
-            playlistItem.addEventListener('drop', handleDrop);
-            playlistItem.addEventListener('dragend', handleDragEnd);
-        }
-        
-        playlistList.appendChild(playlistItem);
-    });
-}
-
-function updateCurrentPlaylistItem(videoId) {
-    document.querySelectorAll('.playlist-item').forEach(item => {
-        item.classList.toggle('playing', item.dataset.videoId === videoId);
-    });
-}
-
-function voteSong(videoId, vote) {
-    if (!currentRoom) return;
+    player.loadVideoById(videoId);
     
-    // Toggle vote if clicking same vote again
-    const currentVote = userVotes.get(videoId)?.find(v => v.userId === socket.id)?.vote;
-    const newVote = currentVote === vote ? 'remove' : vote;
-    
-    socket.emit('vote-song', {
+    socket.emit('video-change', {
         room: currentRoom,
         videoId,
-        vote: newVote
+        title,
+        duration
     });
+    
+    showToast('Video Loaded', title, 'success');
+}
+
+function loadVideoForClient(videoId, title, duration) {
+    currentVideoId = videoId;
+    player.loadVideoById(videoId);
+    
+    if (audioOnly) {
+        const titleEl = songInfoAudio.querySelector('.song-title');
+        const artistEl = songInfoAudio.querySelector('.song-artist');
+        if (titleEl) titleEl.textContent = title;
+        if (artistEl) artistEl.textContent = 'YouTube';
+    }
+}
+
+function addToPlaylist(videoId, title, duration) {
+    socket.emit('add-to-playlist', {
+        room: currentRoom,
+        videoId,
+        title,
+        duration,
+        addedBy: username
+    });
+    
+    showToast('Added to Queue', title, 'success');
 }
 
 function removeFromPlaylist(videoId) {
-    if (!currentRoom || !isHost) return;
+    if (!isHost) {
+        showToast('Permission Denied', 'Only the host can remove videos', 'error');
+        return;
+    }
     
     socket.emit('remove-from-playlist', {
         room: currentRoom,
@@ -812,403 +459,312 @@ function removeFromPlaylist(videoId) {
 }
 
 function clearPlaylist() {
-    if (!currentRoom || !isHost) return;
-    
-    if (confirm('Are you sure you want to clear the entire playlist?')) {
-        playlist.forEach(video => {
-            socket.emit('remove-from-playlist', {
-                room: currentRoom,
-                videoId: video.id
-            });
-        });
+    if (!isHost) {
+        showToast('Permission Denied', 'Only the host can clear the playlist', 'error');
+        return;
     }
+    
+    socket.emit('clear-playlist', { room: currentRoom });
 }
 
 function shufflePlaylist() {
-    if (!currentRoom || !isHost || playlist.length < 2) return;
-    
-    // Fisher-Yates shuffle
-    const shuffled = [...playlist];
-    for (let i = shuffled.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-    }
-    
-    // Emit reorder events (simplified - in production you'd batch these)
-    shuffled.forEach((video, newIndex) => {
-        const oldIndex = playlist.findIndex(v => v.id === video.id);
-        if (oldIndex !== newIndex) {
-            socket.emit('reorder-playlist', {
-                room: currentRoom,
-                fromIndex: oldIndex,
-                toIndex: newIndex
-            });
-        }
-    });
-}
-
-// Drag and drop for playlist reordering
-let draggedItem = null;
-
-function handleDragStart(e) {
-    if (!isHost) return;
-    draggedItem = this;
-    e.dataTransfer.effectAllowed = 'move';
-    e.dataTransfer.setData('text/html', this.innerHTML);
-    setTimeout(() => this.style.display = 'none', 0);
-}
-
-function handleDragOver(e) {
-    if (!isHost) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
-}
-
-function handleDrop(e) {
-    if (!isHost || !draggedItem) return;
-    e.preventDefault();
-    
-    const target = e.target.closest('.playlist-item');
-    if (!target || target === draggedItem) return;
-    
-    const fromIndex = Array.from(playlistList.children).indexOf(draggedItem);
-    const toIndex = Array.from(playlistList.children).indexOf(target);
-    
-    if (fromIndex !== toIndex) {
-        socket.emit('reorder-playlist', {
-            room: currentRoom,
-            fromIndex,
-            toIndex
-        });
-    }
-}
-
-function handleDragEnd() {
-    if (!isHost) return;
-    this.style.display = '';
-    draggedItem = null;
-}
-
-function updateVotesUI(videoId, votes) {
-    userVotes.set(videoId, votes);
-    
-    const playlistItem = document.querySelector(`.playlist-item[data-video-id="${videoId}"]`);
-    if (playlistItem) {
-        const likeCount = votes.filter(v => v.vote === 'like').length;
-        const dislikeCount = votes.filter(v => v.vote === 'dislike').length;
-        const userVote = votes.find(v => v.userId === socket.id)?.vote;
-        
-        const likeBtn = playlistItem.querySelector('.vote-btn:not(.dislike)');
-        const dislikeBtn = playlistItem.querySelector('.vote-btn.dislike');
-        const likeCountSpan = likeBtn?.nextElementSibling;
-        const dislikeCountSpan = dislikeBtn?.nextElementSibling;
-        
-        if (likeBtn) likeBtn.classList.toggle('active', userVote === 'like');
-        if (dislikeBtn) dislikeBtn.classList.toggle('active', userVote === 'dislike');
-        if (likeCountSpan) likeCountSpan.textContent = likeCount;
-        if (dislikeCountSpan) dislikeCountSpan.textContent = dislikeCount;
-    }
-}
-
-// Settings Management
-function showSettingsModal() {
-    updateSettingsUI();
-    settingsModal.classList.add('active');
-}
-
-function updateSettingsUI() {
-    collaborativePlaylistToggle.checked = roomSettings.collaborativePlaylist;
-    autoPlayNextToggle.checked = roomSettings.autoPlayNext;
-    
-    voteModeRadios.forEach(radio => {
-        radio.checked = radio.value === roomSettings.voteMode;
-    });
-    
-    // Update add to playlist button visibility
-    addToPlaylistBtn.style.display = isHost || roomSettings.collaborativePlaylist ? 'inline-flex' : 'none';
-}
-
-function saveSettings() {
-    if (!currentRoom || !isHost) return;
-    
-    const settings = {
-        collaborativePlaylist: collaborativePlaylistToggle.checked,
-        autoPlayNext: autoPlayNextToggle.checked,
-        voteMode: document.querySelector('input[name="vote-mode"]:checked')?.value || 'sequential'
-    };
-    
-    socket.emit('update-room-settings', {
-        room: currentRoom,
-        settings
-    });
-    
-    settingsModal.classList.remove('active');
-}
-
-// Username Management
-function showChangeUsernameModal() {
-    newUsernameInput.value = username;
-    changeUsernameModal.classList.add('active');
-    newUsernameInput.focus();
-}
-
-function saveUsername() {
-    const newUsername = newUsernameInput.value.trim();
-    if (!newUsername || newUsername === username) {
-        changeUsernameModal.classList.remove('active');
+    if (!isHost) {
+        showToast('Permission Denied', 'Only the host can shuffle the playlist', 'error');
         return;
     }
     
-    if (newUsername.length > 20) {
-        showToast('Error', 'Username must be 20 characters or less', 'error');
-        return;
+    socket.emit('shuffle-playlist', { room: currentRoom });
+}
+
+function playNextVideo() {
+    if (!isHost) return;
+    
+    socket.emit('next-video', { room: currentRoom });
+}
+
+function playPreviousVideo() {
+    if (!isHost || playlist.length === 0) return;
+    
+    const currentIndex = playlist.findIndex(v => v.id === currentVideoId);
+    const prevIndex = currentIndex > 0 ? currentIndex - 1 : playlist.length - 1;
+    
+    if (prevIndex >= 0 && playlist[prevIndex]) {
+        const video = playlist[prevIndex];
+        loadVideo(video.id, video.title, video.duration);
     }
-    
-    socket.emit('update-username', {
-        room: currentRoom,
-        username: newUsername
-    });
-    
-    changeUsernameModal.classList.remove('active');
 }
 
 // UI Updates
-function switchToRoomView() {
-    connectionSection.style.display = 'none';
-    roomSection.style.display = 'block';
-    usernameModal.classList.remove('active');
-    startSyncInterval();
+function updatePlaylist(playlistData) {
+    playlist = playlistData;
     
-    // Show/hide host-only controls
-    const hostControls = document.querySelectorAll('.host-only');
-    hostControls.forEach(control => {
-        control.style.display = isHost ? 'block' : 'none';
-    });
-}
-
-function switchToConnectionView() {
-    connectionSection.style.display = 'block';
-    roomSection.style.display = 'none';
+    if (playlist.length === 0) {
+        playlistList.innerHTML = `
+            <div class="empty-state">
+                <i class="fas fa-music"></i>
+                <p>No songs in queue</p>
+                <span>Add videos to get started</span>
+            </div>
+        `;
+        return;
+    }
     
-    // Reset UI
-    youtubeUrlInput.value = '';
-    currentVideoId = null;
-    users = [];
-    playlist = [];
-    updateUserList([]);
-    updatePlaylistUI();
-    chatMessages.innerHTML = '<div class="system-message">Welcome to the music room! Messages are temporary and will disappear when you leave.</div>';
-    
-    // Reset song info
-    updateSongInfo({ title: 'No song loaded', duration: 0 });
-    
-    // Reset audio mode
-    audioOnly = false;
-    audioModeIndicator.style.display = 'none';
-    audioVisualizer.style.display = 'none';
-    document.getElementById('player').style.display = 'block';
-    stopVisualizer();
-}
-
-function updateRoomCode(code) {
-    currentRoomCode.textContent = code;
-}
-
-function updateUserList(userList) {
-    users = userList;
-    userCount.textContent = users.length;
-    
-    usersList.innerHTML = '';
-    users.forEach(user => {
-        const userElement = document.createElement('div');
-        userElement.className = `user-item ${user.isHost ? 'user-host' : ''}`;
-        
-        const initial = user.name.charAt(0).toUpperCase();
-        const displayName = user.id === socket.id ? username || 'You' : user.name;
-        
-        userElement.innerHTML = `
-            <div class="user-avatar">${initial}</div>
-            <div class="user-info">
-                <div class="user-name">${displayName}${user.id === socket.id ? ' (You)' : ''}</div>
-                <div class="user-volume">
-                    <i class="fas fa-volume-up"></i>
-                    <input type="range" class="user-volume-slider" min="0" max="100" 
-                           value="${user.volume || 100}" 
-                           ${user.id === socket.id ? '' : 'disabled'}
-                           oninput="${user.id === socket.id ? `updateUserVolume(this.value)` : ''}">
+    playlistList.innerHTML = playlist.map((video, index) => `
+        <div class="playlist-item ${video.id === currentVideoId ? 'playing' : ''}">
+            <div class="playlist-thumbnail">
+                <img src="https://img.youtube.com/vi/${video.id}/mqdefault.jpg" alt="${video.title}">
+            </div>
+            <div class="playlist-info">
+                <div class="playlist-title">${video.title}</div>
+                <div class="playlist-meta">
+                    <span><i class="fas fa-user"></i> ${video.addedBy || 'Unknown'}</span>
+                    ${video.votes !== undefined ? `<span><i class="fas fa-heart"></i> ${video.votes}</span>` : ''}
                 </div>
             </div>
-            ${user.isHost ? '<div class="user-host-badge">Host</div>' : ''}
-        `;
-        
-        usersList.appendChild(userElement);
-    });
+            <div class="playlist-actions">
+                ${isHost ? `
+                    <button class="btn-icon" onclick="removeFromPlaylist('${video.id}')" title="Remove">
+                        <i class="fas fa-times"></i>
+                    </button>
+                ` : ''}
+            </div>
+        </div>
+    `).join('');
 }
 
-function updateUserVolume(volume) {
-    if (!currentRoom) return;
+function updateUsersList(usersData) {
+    users = usersData;
+    userCount.textContent = users.length;
     
-    socket.emit('update-volume', {
-        room: currentRoom,
-        volume: parseInt(volume)
-    });
-}
-
-function updateSongInfo(videoData) {
-    const songTitle = document.querySelector('.song-title');
-    const songDetails = document.querySelector('.song-details');
-    const audioSongTitle = document.querySelector('.song-info-audio .song-title');
-    const audioSongDetails = document.querySelector('.song-info-audio .song-details');
-    
-    if (videoData.title) {
-        songTitle.textContent = videoData.title;
-        songDetails.textContent = videoData.duration > 0 ? `Duration: ${formatTime(videoData.duration)}` : 'YouTube Video';
-        
-        if (audioOnly) {
-            audioSongTitle.textContent = videoData.title;
-            audioSongDetails.textContent = 'Now Playing';
-        }
-    } else {
-        songTitle.textContent = 'No song loaded';
-        songDetails.textContent = 'Add a YouTube URL to start';
-    }
+    usersList.innerHTML = users.map(user => `
+        <div class="user-item">
+            <div class="user-avatar">${user.name.charAt(0).toUpperCase()}</div>
+            <div class="user-info">
+                <div class="user-name">${user.name}</div>
+                ${user.isHost ? '<div class="user-badge"><i class="fas fa-crown"></i> Host</div>' : ''}
+            </div>
+        </div>
+    `).join('');
 }
 
 function addChatMessage(user, message, timestamp) {
-    const messageElement = document.createElement('div');
-    messageElement.className = 'chat-message';
+    const isOwn = user.id === socket.id;
+    const time = new Date(timestamp).toLocaleTimeString('en-US', { 
+        hour: '2-digit', 
+        minute: '2-digit' 
+    });
     
-    const time = new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const displayName = user.id === socket.id ? 'You' : user.name;
-    
-    messageElement.innerHTML = `
-        <div class="message-sender">${displayName}</div>
-        <div class="message-text">${message}</div>
-        <div class="message-time">${time}</div>
+    const messageEl = document.createElement('div');
+    messageEl.className = `chat-message ${isOwn ? 'own' : ''}`;
+    messageEl.innerHTML = `
+        <div class="chat-user">${user.name}</div>
+        <div class="chat-text">${escapeHtml(message)}</div>
+        <div class="chat-time">${time}</div>
     `;
     
-    chatMessages.appendChild(messageElement);
+    chatMessages.appendChild(messageEl);
     chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
-function addSystemMessage(message) {
-    const messageElement = document.createElement('div');
-    messageElement.className = 'system-message';
-    messageElement.textContent = message;
-    chatMessages.appendChild(messageElement);
-    chatMessages.scrollTop = chatMessages.scrollHeight;
+function sendChatMessage() {
+    const message = chatInput.value.trim();
+    if (!message || !currentRoom) return;
+    
+    socket.emit('chat-message', {
+        room: currentRoom,
+        message
+    });
+    
+    chatInput.value = '';
 }
 
-// Utility Functions
-function getRandomUserName() {
-    const adjectives = ['Cool', 'Happy', 'Musical', 'Rhythmic', 'Melodic', 'Harmonic', 'Sync', 'Jam', 'Beat', 'Tune'];
-    const nouns = ['Listener', 'Fan', 'Groover', 'Dancer', 'Vibes', 'Soul', 'Ears', 'Beat', 'Rhythm', 'Melody'];
-    const randomAdjective = adjectives[Math.floor(Math.random() * adjectives.length)];
-    const randomNoun = nouns[Math.floor(Math.random() * nouns.length)];
-    return `${randomAdjective} ${randomNoun}`;
+function updateConnectionStatus(connected) {
+    const statusDot = connectionStatus.querySelector('.status-dot');
+    const statusText = connectionStatus.querySelector('.status-text');
+    
+    if (connected) {
+        statusDot.classList.add('connected');
+        statusDot.classList.remove('disconnected');
+        statusText.textContent = 'Connected';
+    } else {
+        statusDot.classList.remove('connected');
+        statusDot.classList.add('disconnected');
+        statusText.textContent = 'Disconnected';
+    }
 }
 
+function updateLatencyDisplay(ms) {
+    latencyValue.textContent = `${ms}ms`;
+    
+    latencyInfo.classList.remove('good', 'medium', 'poor');
+    if (ms < 100) {
+        latencyInfo.classList.add('good');
+    } else if (ms < 200) {
+        latencyInfo.classList.add('medium');
+    } else {
+        latencyInfo.classList.add('poor');
+    }
+}
+
+function updatePlayPauseButton(state) {
+    if (state === 'playing') {
+        playPauseIcon.className = 'fas fa-pause';
+    } else {
+        playPauseIcon.className = 'fas fa-play';
+    }
+}
+
+function toggleAudioOnlyDisplay(enabled) {
+    const playerContainer = document.getElementById('player-container');
+    const playerEl = document.getElementById('player');
+    
+    if (enabled) {
+        playerEl.style.display = 'none';
+        audioVisualizer.style.display = 'block';
+        if (player && player.getPlayerState() === YT.PlayerState.PLAYING) {
+            startVisualizer();
+        }
+    } else {
+        playerEl.style.display = 'block';
+        audioVisualizer.style.display = 'none';
+        stopVisualizer();
+    }
+}
+
+function toggleAudioOnly() {
+    if (!isHost) {
+        showToast('Permission Denied', 'Only the host can toggle audio mode', 'error');
+        return;
+    }
+    
+    audioOnly = !audioOnly;
+    
+    socket.emit('toggle-audio-only', {
+        room: currentRoom,
+        audioOnly
+    });
+    
+    toggleAudioOnlyDisplay(audioOnly);
+}
+
+// Room Management
+function createRoom() {
+    const name = hostUsernameInput.value.trim() || 'Host';
+    
+    socket.emit('create-room', { username: name });
+}
+
+function joinRoom() {
+    const code = roomCodeInput.value.trim().toUpperCase();
+    
+    if (code.length !== 6) {
+        showToast('Invalid Code', 'Room code must be 6 characters', 'error');
+        return;
+    }
+    
+    pendingJoinData = { room: code };
+    usernameModal.classList.add('active');
+}
+
+function submitUsername() {
+    if (!pendingJoinData) return;
+    
+    const name = usernameInput.value.trim() || 'User';
+    
+    socket.emit('join-room', {
+        room: pendingJoinData.room,
+        username: name
+    });
+    
+    usernameModal.classList.remove('active');
+    usernameInput.value = '';
+    pendingJoinData = null;
+}
+
+function leaveRoom() {
+    if (!currentRoom) return;
+    
+    socket.emit('leave-room', { room: currentRoom });
+    
+    stopSyncInterval();
+    currentRoom = null;
+    isHost = false;
+    users = [];
+    playlist = [];
+    currentVideoId = null;
+    
+    if (player) {
+        player.stopVideo();
+    }
+    
+    switchToConnectionView();
+    showToast('Left Room', 'You have left the room', 'info');
+}
+
+function switchToRoomView() {
+    connectionSection.style.display = 'none';
+    roomSection.style.display = 'block';
+    currentRoomCode.textContent = currentRoom;
+}
+
+function switchToConnectionView() {
+    connectionSection.style.display = 'flex';
+    roomSection.style.display = 'none';
+}
+
+// Utilities
 function formatTime(seconds) {
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
-function showRoomCreatedModal() {
-    roomCreatedModal.classList.add('active');
-}
-
-function hideRoomCreatedModal() {
-    roomCreatedModal.classList.remove('active');
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
 }
 
 function showToast(title, message, type = 'info') {
     const toastContainer = document.getElementById('toast-container');
     const toast = document.createElement('div');
     toast.className = `toast ${type}`;
-    
-    const icon = type === 'success' ? 'fa-check-circle' : 
-                 type === 'error' ? 'fa-exclamation-circle' : 
-                 type === 'warning' ? 'fa-exclamation-triangle' : 'fa-info-circle';
-    
     toast.innerHTML = `
-        <i class="fas ${icon}"></i>
+        <div class="toast-icon"></div>
         <div class="toast-content">
-            <div class="toast-title">${title}</div>
-            <div class="toast-message">${message}</div>
+            <h4>${title}</h4>
+            <p>${message}</p>
         </div>
     `;
     
     toastContainer.appendChild(toast);
     
-    // Remove toast after 5 seconds
     setTimeout(() => {
-        toast.style.animation = 'slideOut 0.3s forwards';
-        setTimeout(() => {
-            toastContainer.removeChild(toast);
-        }, 300);
-    }, 5000);
-}
-
-function updateConnectionStatus(connected) {
-    const icon = connectionStatus.querySelector('i');
-    const text = connectionStatus.querySelector('span');
-    
-    if (connected) {
-        icon.className = 'fas fa-circle connected';
-        text.textContent = 'Connected';
-    } else {
-        icon.className = 'fas fa-circle disconnected';
-        text.textContent = 'Disconnected';
-    }
-}
-
-function updateLatency(latency) {
-    latencyValue.textContent = latency;
-    
-    if (latency < 50) {
-        latencyInfo.style.color = 'var(--success)';
-    } else if (latency < 100) {
-        latencyInfo.style.color = 'var(--warning)';
-    } else {
-        latencyInfo.style.color = 'var(--danger)';
-    }
+        toast.style.animation = 'toastSlideIn 0.3s ease-out reverse';
+        setTimeout(() => toast.remove(), 300);
+    }, 3000);
 }
 
 // Event Listeners
 document.addEventListener('DOMContentLoaded', () => {
-    // Initialize socket connection
     initSocket();
     
-    // Username modal
-    submitUsernameBtn.addEventListener('click', () => {
-        const username = usernameInput.value.trim() || getRandomUserName();
-        if (!username) return;
-        
-        usernameModal.classList.remove('active');
-        pendingJoinData = { username, isCreate: true };
-    });
-    
-    // Room creation/joining
-    createRoomBtn.addEventListener('click', () => {
-        const username = hostUsernameInput.value.trim() || getRandomUserName();
-        showUsernameModal(null, username, true);
-    });
-    
+    createRoomBtn.addEventListener('click', createRoom);
     joinRoomBtn.addEventListener('click', joinRoom);
-    roomCodeInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') joinRoom();
-    });
-    
-    // Room management
+    submitUsernameBtn.addEventListener('click', submitUsername);
     leaveRoomBtn.addEventListener('click', leaveRoom);
+    
     copyRoomCodeBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(currentRoomCode.textContent)
-            .then(() => showToast('Copied', 'Room code copied to clipboard', 'success'))
-            .catch(() => showToast('Error', 'Failed to copy room code', 'error'));
+        navigator.clipboard.writeText(currentRoom);
+        showToast('Copied', 'Room code copied to clipboard', 'success');
     });
     
-    // Video controls
+    copyModalCodeBtn.addEventListener('click', () => {
+        navigator.clipboard.writeText(newRoomCode.textContent);
+        showToast('Copied', 'Room code copied to clipboard', 'success');
+        roomCreatedModal.classList.remove('active');
+    });
+    
     loadVideoBtn.addEventListener('click', () => {
         const url = youtubeUrlInput.value.trim();
         if (url) {
@@ -1235,48 +791,19 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
     
-    youtubeUrlInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            if (e.ctrlKey || e.metaKey) {
-                addToPlaylistBtn.click();
-            } else {
-                loadVideoBtn.click();
-            }
-        }
-    });
-    
     playPauseBtn.addEventListener('click', () => {
-        if (player) {
-            const state = player.getPlayerState();
-            if (state === YT.PlayerState.PLAYING) {
-                player.pauseVideo();
-                playPauseIcon.className = 'fas fa-play';
-            } else {
-                player.playVideo();
-                playPauseIcon.className = 'fas fa-pause';
-            }
+        if (!player) return;
+        
+        const state = player.getPlayerState();
+        if (state === YT.PlayerState.PLAYING) {
+            player.pauseVideo();
+        } else {
+            player.playVideo();
         }
     });
     
-    prevBtn.addEventListener('click', () => {
-        if (isHost && currentRoom && playlist.length > 0) {
-            const currentIndex = playlist.findIndex(v => v.id === currentVideoId);
-            let prevIndex = currentIndex - 1;
-            if (prevIndex < 0) prevIndex = playlist.length - 1;
-            
-            if (prevIndex >= 0) {
-                const prevVideo = playlist[prevIndex];
-                loadVideo(prevVideo.id, prevVideo.title, prevVideo.duration);
-            }
-        }
-    });
-    
-    nextBtn.addEventListener('click', () => {
-        if (isHost && currentRoom) {
-            socket.emit('next-video', { room: currentRoom });
-        }
-    });
-    
+    prevBtn.addEventListener('click', playPreviousVideo);
+    nextBtn.addEventListener('click', playNextVideo);
     audioOnlyBtn.addEventListener('click', toggleAudioOnly);
     
     volumeSlider.addEventListener('input', (e) => {
@@ -1285,29 +812,58 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
     
-    // Progress bar
     progressBar.addEventListener('click', (e) => {
-        if (player && currentVideoId) {
-            const rect = progressBar.getBoundingClientRect();
-            const percent = (e.clientX - rect.left) / rect.width;
-            const duration = player.getDuration();
-            const newTime = percent * duration;
-            
-            player.seekTo(newTime, true);
-            
-            // If host, broadcast seek
-            if (isHost && currentRoom) {
-                socket.emit('sync-time', {
-                    room: currentRoom,
-                    timestamp: newTime,
-                    state: player.getPlayerState() === 1 ? 'playing' : 'paused',
-                    clientTime: Date.now()
-                });
+        if (!player || !currentVideoId) return;
+        
+        const rect = progressBar.getBoundingClientRect();
+        const percent = (e.clientX - rect.left) / rect.width;
+        const duration = player.getDuration();
+        const newTime = percent * duration;
+        
+        player.seekTo(newTime, true);
+        
+        if (isHost) {
+            socket.emit('sync-time', {
+                room: currentRoom,
+                timestamp: newTime,
+                state: player.getPlayerState() === YT.PlayerState.PLAYING ? 'playing' : 'paused'
+            });
+        }
+    });
+    
+    clearPlaylistBtn.addEventListener('click', clearPlaylist);
+    shufflePlaylistBtn.addEventListener('click', shufflePlaylist);
+    
+    sendChatBtn.addEventListener('click', sendChatMessage);
+    chatInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendChatMessage();
+    });
+    
+    usernameInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') submitUsername();
+    });
+    
+    roomCodeInput.addEventListener('input', (e) => {
+        e.target.value = e.target.value.toUpperCase();
+    });
+    
+    youtubeUrlInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            if (e.shiftKey) {
+                addToPlaylistBtn.click();
+            } else {
+                loadVideoBtn.click();
             }
         }
     });
     
-    // Update progress bar and time display
+    document.querySelectorAll('.close-modal').forEach(btn => {
+        btn.addEventListener('click', function() {
+            this.closest('.modal').classList.remove('active');
+        });
+    });
+    
+    // Progress bar update
     setInterval(() => {
         if (player && currentVideoId) {
             const currentTime = player.getCurrentTime();
@@ -1316,110 +872,19 @@ document.addEventListener('DOMContentLoaded', () => {
             if (duration > 0) {
                 const percent = (currentTime / duration) * 100;
                 progressFill.style.width = `${percent}%`;
-                
                 currentTimeDisplay.textContent = formatTime(currentTime);
                 durationDisplay.textContent = formatTime(duration);
             }
         }
     }, 100);
     
-    // Playlist controls
-    clearPlaylistBtn.addEventListener('click', clearPlaylist);
-    shufflePlaylistBtn.addEventListener('click', shufflePlaylist);
-    
-    // Settings
-    settingsBtn.addEventListener('click', showSettingsModal);
-    saveSettingsBtn.addEventListener('click', saveSettings);
-    
-    // Username change
-    changeUsernameBtn.addEventListener('click', showChangeUsernameModal);
-    saveUsernameBtn.addEventListener('click', saveUsername);
-    newUsernameInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') saveUsername();
-    });
-    
-    // Chat
-    sendChatBtn.addEventListener('click', sendChatMessage);
-    chatInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') sendChatMessage();
-    });
-    
-    // Modals
-    document.querySelectorAll('.close-modal').forEach(btn => {
-        btn.addEventListener('click', function() {
-            this.closest('.modal').classList.remove('active');
-        });
-    });
-    
-    copyModalCodeBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(newRoomCode.textContent)
-            .then(() => {
-                showToast('Copied', 'Room code copied to clipboard', 'success');
-                hideRoomCreatedModal();
-            })
-            .catch(() => showToast('Error', 'Failed to copy room code', 'error'));
-    });
-    
-    // Close modals on outside click
-    document.querySelectorAll('.modal').forEach(modal => {
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                modal.classList.remove('active');
-            }
-        });
-    });
-    
-    // Test latency periodically
+    // Latency monitoring
     setInterval(() => {
-        if (socket.connected) {
+        if (socket && socket.connected) {
             socket.emit('ping', Date.now());
         }
     }, 5000);
-    
-    // Auto-quality adjustment based on latency
-    setInterval(() => {
-        if (player && currentVideoId && latency > 200) {
-            // Reduce quality if high latency
-            const playbackRate = player.getPlaybackRate();
-            if (playbackRate === 1) {
-                player.setPlaybackRate(0.75);
-                showToast('Quality Adjusted', 'Reduced playback quality due to high latency', 'warning');
-            }
-        }
-    }, 10000);
 });
 
-function sendChatMessage() {
-    const message = chatInput.value.trim();
-    if (message && currentRoom) {
-        socket.emit('chat-message', {
-            room: currentRoom,
-            message: message
-        });
-        
-        // Add message locally immediately
-        addChatMessage({ id: socket.id, name: username || 'You' }, message, Date.now());
-        
-        chatInput.value = '';
-    }
-}
-
-// Make functions available globally
-window.voteSong = voteSong;
+// Make functions globally available
 window.removeFromPlaylist = removeFromPlaylist;
-
-// Add CSS for slideOut animation
-const style = document.createElement('style');
-style.textContent = `
-    @keyframes slideOut {
-        from {
-            transform: translateX(0);
-            opacity: 1;
-        }
-        to {
-            transform: translateX(100%);
-            opacity: 0;
-        }
-    }
-`;
-document.head.appendChild(style);

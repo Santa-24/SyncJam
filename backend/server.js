@@ -10,19 +10,20 @@ const io = socketIo(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    pingInterval: 10000,
+    pingTimeout: 5000,
+    transports: ['websocket', 'polling']
 });
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.static(__dirname));
 
-// Serve static files from the frontend directory
-app.use(express.static(path.join(__dirname, '../frontend')));
-
-// Serve the main HTML file for all routes (SPA support)
-app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, '../frontend/index.html'));
+// Serve the main HTML file
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
 // In-memory storage for rooms
@@ -38,9 +39,17 @@ function generateRoomCode() {
     return code;
 }
 
+// High-precision timestamp
+function getServerTime() {
+    return Date.now() + process.hrtime()[1] / 1000000;
+}
+
 // Socket.io connection handling
 io.on('connection', (socket) => {
     console.log('New client connected:', socket.id);
+
+    // Send server time for initial sync
+    socket.emit('server-time', { serverTime: getServerTime() });
 
     // Create a new room
     socket.on('create-room', (data) => {
@@ -57,20 +66,19 @@ io.on('connection', (socket) => {
             currentVideo: null,
             playbackState: 'paused',
             playbackTime: 0,
+            lastUpdateTime: getServerTime(),
             audioOnly: false,
             createdAt: Date.now(),
-            votes: new Map() // Track votes for songs
+            votes: new Map()
         });
 
-        // Add host to room
         const room = rooms.get(roomCode);
         const userName = username || 'Host';
         room.users.set(socket.id, {
             id: socket.id,
             name: userName,
             isHost: true,
-            joinedAt: Date.now(),
-            volume: 100
+            joinedAt: Date.now()
         });
 
         socket.join(roomCode);
@@ -98,7 +106,6 @@ io.on('connection', (socket) => {
             return;
         }
 
-        // Validate and ensure unique username
         const baseName = (username || `User${roomData.users.size + 1}`).trim().substring(0, 20);
         let finalName = baseName;
         let counter = 1;
@@ -109,18 +116,22 @@ io.on('connection', (socket) => {
             counter++;
         }
 
-        // Add user to room
         roomData.users.set(socket.id, {
             id: socket.id,
             name: finalName,
             isHost: false,
-            joinedAt: Date.now(),
-            volume: 100
+            joinedAt: Date.now()
         });
 
         socket.join(room);
 
-        // Notify the user who joined
+        // Calculate current playback position if playing
+        let currentTime = roomData.playbackTime;
+        if (roomData.playbackState === 'playing') {
+            const elapsed = (getServerTime() - roomData.lastUpdateTime) / 1000;
+            currentTime += elapsed;
+        }
+
         socket.emit('room-joined', {
             room,
             username: finalName,
@@ -128,55 +139,18 @@ io.on('connection', (socket) => {
             playlist: roomData.playlist,
             currentVideo: roomData.currentVideo,
             playbackState: roomData.playbackState,
-            playbackTime: roomData.playbackTime,
+            playbackTime: currentTime,
+            serverTime: getServerTime(),
             audioOnly: roomData.audioOnly,
             isHost: false
         });
 
-        // Notify other users in the room
         socket.to(room).emit('user-joined', {
             user: { id: socket.id, name: finalName },
             users: Array.from(roomData.users.values())
         });
 
         console.log(`${finalName} (${socket.id}) joined room: ${room}`);
-    });
-
-    // Update username
-    socket.on('update-username', (data) => {
-        const { room, username } = data;
-
-        if (rooms.has(room)) {
-            const roomData = rooms.get(room);
-            const user = roomData.users.get(socket.id);
-
-            if (user) {
-                const oldName = user.name;
-                const newName = username.trim().substring(0, 20);
-                
-                // Check for duplicate names (case insensitive)
-                const allNames = Array.from(roomData.users.values())
-                    .filter(u => u.id !== socket.id)
-                    .map(u => u.name.toLowerCase());
-                
-                if (allNames.includes(newName.toLowerCase())) {
-                    socket.emit('username-error', { message: 'Username already taken' });
-                    return;
-                }
-
-                user.name = newName;
-                
-                // Notify all users in room
-                io.to(room).emit('username-updated', {
-                    userId: socket.id,
-                    oldName,
-                    newName,
-                    users: Array.from(roomData.users.values())
-                });
-
-                console.log(`${oldName} changed username to ${newName} in room ${room}`);
-            }
-        }
     });
 
     // Leave room
@@ -188,28 +162,22 @@ io.on('connection', (socket) => {
             const user = roomData.users.get(socket.id);
 
             if (user) {
-                // Remove user from room
                 roomData.users.delete(socket.id);
                 socket.leave(room);
 
-                // Remove user's votes
                 roomData.votes.forEach((votes, videoId) => {
                     roomData.votes.set(videoId, votes.filter(id => id !== socket.id));
                 });
 
-                // Notify other users
                 socket.to(room).emit('user-left', {
                     user,
                     users: Array.from(roomData.users.values())
                 });
 
-                // If room is empty, delete it
                 if (roomData.users.size === 0) {
                     rooms.delete(room);
                     console.log(`Room ${room} deleted (empty)`);
-                }
-                // If host left, assign new host
-                else if (user.isHost) {
+                } else if (user.isHost) {
                     const newHost = Array.from(roomData.users.values())[0];
                     roomData.users.get(newHost.id).isHost = true;
                     roomData.host = newHost.id;
@@ -233,14 +201,18 @@ io.on('connection', (socket) => {
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
 
-            // Check if sender is the host
             if (roomData.host === socket.id) {
                 roomData.currentVideo = { videoId, title, duration };
                 roomData.playbackState = 'paused';
                 roomData.playbackTime = 0;
+                roomData.lastUpdateTime = getServerTime();
 
-                // Broadcast to all other users in room
-                socket.to(room).emit('video-changed', { videoId, title, duration });
+                socket.to(room).emit('video-change', { 
+                    videoId, 
+                    title, 
+                    duration,
+                    serverTime: getServerTime()
+                });
                 console.log(`Video changed in room ${room}: ${videoId}`);
             }
         }
@@ -254,38 +226,23 @@ io.on('connection', (socket) => {
             const roomData = rooms.get(room);
             const user = roomData.users.get(socket.id);
 
-            // Check if collaborative playlist is enabled or user is host
-            if (user && (user.isHost || roomData.collaborativePlaylist)) {
-                const videoData = {
+            if (user) {
+                const playlistItem = {
                     id: videoId,
-                    title: title || `Video ${videoId}`,
-                    duration: duration || 0,
+                    title,
+                    duration,
                     addedBy: addedBy || user.name,
-                    addedById: socket.id,
-                    addedAt: Date.now(),
-                    votes: new Set()
+                    timestamp: Date.now(),
+                    votes: 0
                 };
 
-                roomData.playlist.push(videoData);
-                roomData.votes.set(videoId, []);
+                roomData.playlist.push(playlistItem);
 
-                // Broadcast to all users in room
-                io.to(room).emit('playlist-updated', {
-                    playlist: roomData.playlist,
-                    addedVideo: videoData
+                io.to(room).emit('playlist-updated', { 
+                    playlist: roomData.playlist 
                 });
 
-                console.log(`${user.name} added ${videoId} to playlist in room ${room}`);
-                
-                // If no current video and playlist was empty, play this video
-                if (!roomData.currentVideo && roomData.playlist.length === 1) {
-                    roomData.currentVideo = videoData;
-                    io.to(room).emit('video-changed', { 
-                        videoId, 
-                        title: videoData.title,
-                        duration: videoData.duration 
-                    });
-                }
+                console.log(`Video added to playlist in room ${room}: ${videoId}`);
             }
         }
     });
@@ -299,73 +256,94 @@ io.on('connection', (socket) => {
             const user = roomData.users.get(socket.id);
 
             if (user && user.isHost) {
-                const index = roomData.playlist.findIndex(v => v.id === videoId);
-                if (index !== -1) {
-                    roomData.playlist.splice(index, 1);
-                    roomData.votes.delete(videoId);
+                roomData.playlist = roomData.playlist.filter(v => v.id !== videoId);
+                roomData.votes.delete(videoId);
 
-                    // Broadcast to all users in room
-                    io.to(room).emit('playlist-updated', {
-                        playlist: roomData.playlist,
-                        removedVideo: videoId
-                    });
+                io.to(room).emit('playlist-updated', { 
+                    playlist: roomData.playlist 
+                });
 
-                    console.log(`${user.name} removed ${videoId} from playlist in room ${room}`);
-                }
+                console.log(`Video removed from playlist in room ${room}: ${videoId}`);
             }
         }
     });
 
-    // Reorder playlist
-    socket.on('reorder-playlist', (data) => {
-        const { room, fromIndex, toIndex } = data;
+    // Vote on song
+    socket.on('vote-song', (data) => {
+        const { room, videoId, vote } = data;
+
+        if (rooms.has(room)) {
+            const roomData = rooms.get(room);
+            
+            if (!roomData.votes.has(videoId)) {
+                roomData.votes.set(videoId, []);
+            }
+
+            const votes = roomData.votes.get(videoId);
+            const existingVote = votes.find(v => v.userId === socket.id);
+
+            if (existingVote) {
+                if (existingVote.vote === vote) {
+                    votes.splice(votes.indexOf(existingVote), 1);
+                } else {
+                    existingVote.vote = vote;
+                }
+            } else {
+                votes.push({ userId: socket.id, vote });
+            }
+
+            const playlistItem = roomData.playlist.find(v => v.id === videoId);
+            if (playlistItem) {
+                playlistItem.votes = votes.filter(v => v.vote === 'like').length - 
+                                    votes.filter(v => v.vote === 'dislike').length;
+            }
+
+            io.to(room).emit('playlist-updated', { 
+                playlist: roomData.playlist 
+            });
+        }
+    });
+
+    // Clear playlist
+    socket.on('clear-playlist', (data) => {
+        const { room } = data;
 
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
             const user = roomData.users.get(socket.id);
 
             if (user && user.isHost) {
-                const [movedVideo] = roomData.playlist.splice(fromIndex, 1);
-                roomData.playlist.splice(toIndex, 0, movedVideo);
+                roomData.playlist = [];
+                roomData.votes.clear();
 
-                // Broadcast to all users in room
-                io.to(room).emit('playlist-updated', {
-                    playlist: roomData.playlist,
-                    reordered: true
+                io.to(room).emit('playlist-updated', { 
+                    playlist: [] 
                 });
 
-                console.log(`${user.name} reordered playlist in room ${room}`);
+                console.log(`Playlist cleared in room ${room}`);
             }
         }
     });
 
-    // Vote for song
-    socket.on('vote-song', (data) => {
-        const { room, videoId, vote } = data; // vote: 'like' or 'dislike'
+    // Shuffle playlist
+    socket.on('shuffle-playlist', (data) => {
+        const { room } = data;
 
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
             const user = roomData.users.get(socket.id);
 
-            if (user && roomData.votes.has(videoId)) {
-                const votes = roomData.votes.get(videoId);
-                const userVoteIndex = votes.findIndex(v => v.userId === socket.id);
-
-                if (userVoteIndex !== -1) {
-                    votes.splice(userVoteIndex, 1);
+            if (user && user.isHost) {
+                for (let i = roomData.playlist.length - 1; i > 0; i--) {
+                    const j = Math.floor(Math.random() * (i + 1));
+                    [roomData.playlist[i], roomData.playlist[j]] = [roomData.playlist[j], roomData.playlist[i]];
                 }
 
-                if (vote !== 'remove') {
-                    votes.push({ userId: socket.id, vote, timestamp: Date.now() });
-                }
-
-                // Broadcast updated votes
-                io.to(room).emit('votes-updated', {
-                    videoId,
-                    votes
+                io.to(room).emit('playlist-updated', { 
+                    playlist: roomData.playlist 
                 });
 
-                console.log(`${user.name} voted ${vote} for ${videoId} in room ${room}`);
+                console.log(`Playlist shuffled in room ${room}`);
             }
         }
     });
@@ -376,116 +354,79 @@ io.on('connection', (socket) => {
 
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
-            const user = roomData.users.get(socket.id);
 
-            if (user && user.isHost && roomData.playlist.length > 0) {
-                const currentIndex = roomData.playlist.findIndex(v => v.id === roomData.currentVideo?.id);
-                let nextIndex = (currentIndex + 1) % roomData.playlist.length;
-                
-                // Optional: Get most voted song
-                if (roomData.voteMode === 'popularity') {
-                    const votesByVideo = new Map();
-                    roomData.votes.forEach((votes, videoId) => {
-                        const likeCount = votes.filter(v => v.vote === 'like').length;
-                        const dislikeCount = votes.filter(v => v.vote === 'dislike').length;
-                        votesByVideo.set(videoId, likeCount - dislikeCount);
-                    });
-                    
-                    // Find video with highest score that's not current
-                    let maxScore = -Infinity;
-                    roomData.playlist.forEach((video, index) => {
-                        if (video.id !== roomData.currentVideo?.id) {
-                            const score = votesByVideo.get(video.id) || 0;
-                            if (score > maxScore) {
-                                maxScore = score;
-                                nextIndex = index;
-                            }
-                        }
-                    });
-                }
-
-                const nextVideo = roomData.playlist[nextIndex];
+            if (roomData.host === socket.id && roomData.playlist.length > 0) {
+                const nextVideo = roomData.playlist.shift();
                 roomData.currentVideo = nextVideo;
-                roomData.playbackState = 'paused';
+                roomData.playbackState = 'playing';
                 roomData.playbackTime = 0;
+                roomData.lastUpdateTime = getServerTime();
 
-                // Broadcast to all users in room
-                io.to(room).emit('video-changed', {
-                    videoId: nextVideo.id,
-                    title: nextVideo.title,
-                    duration: nextVideo.duration
+                io.to(room).emit('video-change', { 
+                    videoId: nextVideo.id, 
+                    title: nextVideo.title, 
+                    duration: nextVideo.duration,
+                    serverTime: getServerTime()
+                });
+                
+                io.to(room).emit('playlist-updated', { 
+                    playlist: roomData.playlist 
                 });
 
-                console.log(`Next video played in room ${room}: ${nextVideo.id}`);
+                io.to(room).emit('player-state-change', { 
+                    state: 'playing', 
+                    timestamp: 0,
+                    serverTime: getServerTime()
+                });
+
+                console.log(`Next video in room ${room}: ${nextVideo.id}`);
             }
         }
     });
 
-    // Player state change
+    // Player state change with server timestamp
     socket.on('player-state-change', (data) => {
         const { room, state, timestamp } = data;
 
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
 
-            // Check if sender is the host
             if (roomData.host === socket.id) {
+                const serverTime = getServerTime();
                 roomData.playbackState = state;
                 roomData.playbackTime = timestamp || 0;
+                roomData.lastUpdateTime = serverTime;
 
-                // Broadcast to all other users in room
-                socket.to(room).emit('player-state-change', { state, timestamp });
+                socket.to(room).emit('player-state-change', { 
+                    state, 
+                    timestamp,
+                    serverTime
+                });
+                
                 console.log(`Player state in room ${room}: ${state} at ${timestamp}s`);
             }
         }
     });
 
-    // Time synchronization with latency compensation
+    // Precise time synchronization
     socket.on('sync-time', (data) => {
-        const { room, timestamp, state, clientTime } = data;
+        const { room, timestamp, state } = data;
 
         if (rooms.has(room)) {
             const roomData = rooms.get(room);
 
-            // Check if sender is the host
             if (roomData.host === socket.id) {
-                const serverTime = Date.now();
-                const latency = serverTime - clientTime;
+                const serverTime = getServerTime();
                 
                 roomData.playbackTime = timestamp;
                 roomData.playbackState = state;
-                roomData.lastSync = {
-                    timestamp,
-                    serverTime,
-                    latency
-                };
+                roomData.lastUpdateTime = serverTime;
 
-                // Broadcast to all other users in room with compensation
                 socket.to(room).emit('sync-time', { 
                     timestamp, 
                     state,
-                    serverTime,
-                    latency 
+                    serverTime
                 });
-            }
-        }
-    });
-
-    // Update user volume
-    socket.on('update-volume', (data) => {
-        const { room, volume } = data;
-
-        if (rooms.has(room)) {
-            const roomData = rooms.get(room);
-            const user = roomData.users.get(socket.id);
-
-            if (user) {
-                user.volume = Math.max(0, Math.min(100, volume));
-                
-                // Broadcast to user only (or to host for monitoring)
-                socket.emit('volume-updated', { volume: user.volume });
-                
-                console.log(`${user.name} volume set to ${user.volume}% in room ${room}`);
             }
         }
     });
@@ -501,36 +442,9 @@ io.on('connection', (socket) => {
             if (user && user.isHost) {
                 roomData.audioOnly = audioOnly;
                 
-                // Broadcast to all users in room
                 io.to(room).emit('audio-only-changed', { audioOnly });
                 
                 console.log(`Audio-only mode ${audioOnly ? 'enabled' : 'disabled'} in room ${room}`);
-            }
-        }
-    });
-
-    // Update room settings
-    socket.on('update-room-settings', (data) => {
-        const { room, settings } = data;
-
-        if (rooms.has(room)) {
-            const roomData = rooms.get(room);
-            const user = roomData.users.get(socket.id);
-
-            if (user && user.isHost) {
-                // Update settings
-                roomData.collaborativePlaylist = settings.collaborativePlaylist || false;
-                roomData.voteMode = settings.voteMode || 'sequential';
-                roomData.autoPlayNext = settings.autoPlayNext !== false;
-                
-                // Broadcast to all users in room
-                io.to(room).emit('room-settings-updated', { settings: {
-                    collaborativePlaylist: roomData.collaborativePlaylist,
-                    voteMode: roomData.voteMode,
-                    autoPlayNext: roomData.autoPlayNext
-                }});
-                
-                console.log(`Room settings updated in room ${room}`);
             }
         }
     });
@@ -550,7 +464,6 @@ io.on('connection', (socket) => {
                     timestamp: Date.now()
                 };
 
-                // Broadcast to all users in room (including sender)
                 io.to(room).emit('chat-message', chatData);
             }
         }
@@ -565,32 +478,25 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('Client disconnected:', socket.id);
 
-        // Remove user from all rooms
         rooms.forEach((roomData, roomCode) => {
             if (roomData.users.has(socket.id)) {
                 const user = roomData.users.get(socket.id);
 
-                // Remove user from room
                 roomData.users.delete(socket.id);
 
-                // Remove user's votes
                 roomData.votes.forEach((votes, videoId) => {
                     roomData.votes.set(videoId, votes.filter(v => v.userId !== socket.id));
                 });
 
-                // Notify other users
                 io.to(roomCode).emit('user-left', {
                     user,
                     users: Array.from(roomData.users.values())
                 });
 
-                // If room is empty, delete it
                 if (roomData.users.size === 0) {
                     rooms.delete(roomCode);
                     console.log(`Room ${roomCode} deleted (empty)`);
-                }
-                // If host disconnected, assign new host
-                else if (user.isHost && roomData.users.size > 0) {
+                } else if (user.isHost && roomData.users.size > 0) {
                     const newHost = Array.from(roomData.users.values())[0];
                     roomData.users.get(newHost.id).isHost = true;
                     roomData.host = newHost.id;
@@ -608,13 +514,12 @@ io.on('connection', (socket) => {
     });
 });
 
-// Cleanup empty rooms periodically (every hour)
+// Cleanup empty rooms periodically
 setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
 
     rooms.forEach((roomData, roomCode) => {
-        // Delete rooms older than 24 hours
         if (now - roomData.createdAt > 24 * 60 * 60 * 1000) {
             rooms.delete(roomCode);
             cleaned++;
@@ -650,9 +555,8 @@ app.get('/api/stats', (req, res) => {
         stats.rooms.push({
             code: roomCode,
             users: roomData.users.size,
-            host: roomData.host,
             playlistLength: roomData.playlist.length,
-            currentVideo: roomData.currentVideo?.id,
+            currentVideo: roomData.currentVideo?.videoId,
             audioOnly: roomData.audioOnly,
             createdAt: roomData.createdAt
         });
@@ -666,6 +570,6 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`✅ SyncJam server running on port ${PORT}`);
     console.log(`🚀 SyncJam running in production on port ${PORT}`);
-    console.log(`📊 API Health check: http://localhost:${PORT}/api/health`);
+    console.log(`📊 Health: http://localhost:${PORT}/api/health`);
     console.log(`📈 Stats: http://localhost:${PORT}/api/stats`);
 });
